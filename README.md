@@ -4,6 +4,10 @@ Lightweight watcher that ingests Dorian DDoS Firewall payload tarballs into
 the `versions` table consumed by the [`deploy_license`](../deploy_license)
 API.
 
+> For the end-to-end procedure that ties this watcher together with
+> `deploy_license` to provision a new server, see
+> [`deploy_license/WORKFLOW.md`](../deploy_license/WORKFLOW.md).
+
 It polls an upload directory once a second, computes a SHA-256 over each new
 payload tarball, renames the file to embed the digest, and inserts (or
 upserts) a row into the shared MySQL `versions` table using the digest as the
