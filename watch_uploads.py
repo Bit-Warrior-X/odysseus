@@ -2,8 +2,16 @@
 """
 Poll /opt/dorian/uploads every second for dorian payload tarballs.
 
-Files like: dorian-ddos-firewall-0.1.2-payload.tar.gz
-are renamed to: dorian-ddos-firewall-0.1.2-payload-<sha256>.tar.gz
+Files like:
+  dorian-ddos-firewall-0.1.7-ubuntu-22.04-payload.tar.gz
+  dorian-ddos-firewall-0.1.7-ubuntu-24.04-payload.tar.gz
+
+Legacy (no OS segment):
+  dorian-ddos-firewall-0.1.2-payload.tar.gz
+
+are renamed to embed a SHA-256 digest before -payload:
+  dorian-ddos-firewall-0.1.7-ubuntu-22.04-payload-<sha256>.tar.gz
+
 and a row is inserted into the `versions` table (uuid = full hex digest).
 
 Files whose names already include the content hash are skipped for DB writes.
@@ -17,7 +25,9 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import pymysql
 
@@ -29,17 +39,35 @@ except ImportError:
 WATCH_DIR = Path(os.environ.get("DORIAN_UPLOAD_DIR", "/opt/dorian/uploads"))
 POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "1"))
 
-# dorian-<anything>-<semver>-payload.tar.gz  OR  ...-payload-<64 hex sha256>.tar.gz
+# Optional OS segment: ubuntu-22.04, ubuntu-24.04, etc.
+_OS_SEGMENT = r"(?:-(?P<os>[a-z][a-z0-9]*-\d+(?:\.\d+)+))?"
+_RE_VER = r"(?P<ver>\d+\.\d+\.\d+)"
+
 RE_PLAIN = re.compile(
-    r"^dorian-(?P<body>.+)-(?P<ver>\d+\.\d+\.\d+)-payload\.tar\.gz$",
+    rf"^dorian-(?P<body>.+)-{_RE_VER}{_OS_SEGMENT}-payload\.tar\.gz$",
     re.IGNORECASE,
 )
 RE_HASHED = re.compile(
-    r"^dorian-(?P<body>.+)-(?P<ver>\d+\.\d+\.\d+)-payload-(?P<hash>[a-f0-9]{64})\.tar\.gz$",
+    rf"^dorian-(?P<body>.+)-{_RE_VER}{_OS_SEGMENT}-payload-(?P<hash>[a-f0-9]{{64}})\.tar\.gz$",
     re.IGNORECASE,
 )
 
 LOG = logging.getLogger("watch_uploads")
+
+
+@dataclass(frozen=True)
+class ParsedTarball:
+    version: str
+    os_label: Optional[str]
+
+
+def parse_tarball_name(name: str) -> Optional[ParsedTarball]:
+    m = RE_HASHED.match(name) or RE_PLAIN.match(name)
+    if not m:
+        return None
+    os_raw = m.groupdict().get("os")
+    os_label = os_raw.strip().lower() if os_raw else None
+    return ParsedTarball(version=m.group("ver"), os_label=os_label or None)
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -65,22 +93,33 @@ def db_connect():
     )
 
 
-def insert_version(conn, *, digest_hex: str, version: str, full_name: str, file_path: str) -> None:
+def insert_version(
+    conn,
+    *,
+    digest_hex: str,
+    version: str,
+    os_label: Optional[str],
+    full_name: str,
+    file_path: str,
+) -> None:
     sql = (
-        "INSERT INTO versions (uuid, version, full_name, path, created, updated) "
-        "VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "INSERT INTO versions (uuid, version, os, full_name, path, created, updated) "
+        "VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
         "ON DUPLICATE KEY UPDATE "
-        "full_name = VALUES(full_name), path = VALUES(path), updated = CURRENT_TIMESTAMP"
+        "version = VALUES(version), "
+        "os = VALUES(os), "
+        "full_name = VALUES(full_name), "
+        "path = VALUES(path), "
+        "updated = CURRENT_TIMESTAMP"
     )
     with conn.cursor() as cur:
-        cur.execute(sql, (digest_hex, version, full_name, file_path))
+        cur.execute(sql, (digest_hex, version, os_label, full_name, file_path))
 
 
 def process_plain_file(path: Path) -> None:
-    m = RE_PLAIN.match(path.name)
-    if not m:
+    parsed = parse_tarball_name(path.name)
+    if not parsed:
         return
-    version = m.group("ver")
     old_name = path.name
 
     digest = sha256_file(path)
@@ -102,7 +141,8 @@ def process_plain_file(path: Path) -> None:
             insert_version(
                 conn,
                 digest_hex=digest,
-                version=version,
+                version=parsed.version,
+                os_label=parsed.os_label,
                 full_name=new_name,
                 file_path=str(new_path.resolve()),
             )
@@ -112,7 +152,13 @@ def process_plain_file(path: Path) -> None:
         new_path.rename(path)
         raise
 
-    LOG.info("hashed + renamed + recorded: %s -> %s", old_name, new_name)
+    LOG.info(
+        "hashed + renamed + recorded: %s -> %s (version=%s os=%s)",
+        old_name,
+        new_name,
+        parsed.version,
+        parsed.os_label or "—",
+    )
 
 
 def scan_once() -> None:
@@ -127,7 +173,6 @@ def scan_once() -> None:
             continue
 
         if RE_HASHED.match(path.name):
-            # Filename already carries the content hash suffix; do not insert again.
             continue
 
         if RE_PLAIN.match(path.name):
@@ -139,7 +184,6 @@ def scan_once() -> None:
                 LOG.error("database error for %s: %s", path, e)
             continue
 
-        # Other tar.gz files under the directory are ignored.
         LOG.debug("ignored (pattern): %s", path.name)
 
 

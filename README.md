@@ -21,6 +21,17 @@ For every file under `DORIAN_UPLOAD_DIR` (default `/opt/dorian/uploads`) that
 matches:
 
 ```
+dorian-<body>-<MAJOR.MINOR.PATCH>-<os>-payload.tar.gz
+```
+
+Examples:
+
+- `dorian-ddos-firewall-0.1.7-ubuntu-22.04-payload.tar.gz`
+- `dorian-ddos-firewall-0.1.7-ubuntu-24.04-payload.tar.gz`
+
+Legacy uploads without an OS segment are still accepted:
+
+```
 dorian-<body>-<MAJOR.MINOR.PATCH>-payload.tar.gz
 ```
 
@@ -30,11 +41,14 @@ the watcher will:
 2. Rename it in place to:
 
    ```
-   dorian-<body>-<MAJOR.MINOR.PATCH>-payload-<sha256>.tar.gz
+   dorian-<body>-<MAJOR.MINOR.PATCH>-<os>-payload-<sha256>.tar.gz
    ```
+
+   (omit `<os>-` when the upload had no OS segment)
 3. Upsert a row into `versions`:
    - `uuid`    — full hex SHA-256 digest
    - `version` — captured `MAJOR.MINOR.PATCH`
+   - `os`      — OS label from the filename (e.g. `ubuntu-22.04`), or `NULL` for legacy names
    - `full_name` — the new filename (with hash suffix)
    - `path` — absolute path of the renamed file
    - `created` / `updated` — current timestamp (`updated` refreshed on conflict)
@@ -54,7 +68,9 @@ original name so the next scan can retry cleanly.
 - MySQL/MariaDB reachable with the credentials below
 - The `versions` table from
   [`deploy_license/schema.sql`](../deploy_license/schema.sql) must already
-  exist in the target database
+  exist in the target database (including the `os` column; run
+  [`deploy_license/migrations/001_versions_os.sql`](../deploy_license/migrations/001_versions_os.sql)
+  once if upgrading an older database)
 
 Python deps (see `requirements.txt`):
 
