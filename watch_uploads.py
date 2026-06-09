@@ -85,8 +85,8 @@ def db_connect():
     return pymysql.connect(
         host=os.environ.get("DB_HOST", "127.0.0.1"),
         port=int(os.environ.get("DB_PORT", "3306")),
-        user=os.environ.get("DB_USER", "root"),
-        password=os.environ.get("DB_PASSWORD", ""),
+        user=os.environ.get("DB_USER", "dorian"),
+        password=os.environ.get("DB_PASSWORD", "StrongPassword123!"),
         database=os.environ.get("DB_NAME", "lic"),
         autocommit=True,
         cursorclass=pymysql.cursors.DictCursor,
