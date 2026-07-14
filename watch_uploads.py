@@ -9,12 +9,14 @@ Files like:
 Legacy (no OS segment):
   dorian-ddos-firewall-0.1.2-payload.tar.gz
 
-are renamed to embed a SHA-256 digest before -payload:
+Plain uploads are renamed to embed a SHA-256 digest before -payload:
   dorian-ddos-firewall-0.1.7-ubuntu-22.04-payload-<sha256>.tar.gz
 
-and a row is inserted into the `versions` table (uuid = full hex digest).
+Pre-hashed uploads are also registered. The content hash is always computed
+from the file; a wrong placeholder hash in the filename is corrected on rename.
 
-Files whose names already include the content hash are skipped for DB writes.
+Rows are upserted into `versions` keyed by (version, os); uuid is the file
+content SHA-256 hex digest.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pymysql
 
@@ -93,6 +95,37 @@ def db_connect():
     )
 
 
+def version_row_for(
+    conn, version: str, os_label: Optional[str]
+) -> Optional[dict[str, Any]]:
+    with conn.cursor() as cur:
+        if os_label:
+            cur.execute(
+                "SELECT id, uuid, path FROM versions WHERE version = %s AND os = %s LIMIT 1",
+                (version, os_label),
+            )
+        else:
+            cur.execute(
+                "SELECT id, uuid, path FROM versions WHERE version = %s AND os IS NULL LIMIT 1",
+                (version,),
+            )
+        return cur.fetchone()
+
+
+def needs_registration(
+    conn,
+    *,
+    version: str,
+    os_label: Optional[str],
+    file_path: str,
+    digest_hex: str,
+) -> bool:
+    row = version_row_for(conn, version, os_label)
+    if row is None:
+        return True
+    return row.get("path") != file_path or row.get("uuid") != digest_hex
+
+
 def insert_version(
     conn,
     *,
@@ -106,8 +139,7 @@ def insert_version(
         "INSERT INTO versions (uuid, version, os, full_name, path, created, updated) "
         "VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
         "ON DUPLICATE KEY UPDATE "
-        "version = VALUES(version), "
-        "os = VALUES(os), "
+        "uuid = VALUES(uuid), "
         "full_name = VALUES(full_name), "
         "path = VALUES(path), "
         "updated = CURRENT_TIMESTAMP"
@@ -116,48 +148,75 @@ def insert_version(
         cur.execute(sql, (digest_hex, version, os_label, full_name, file_path))
 
 
-def process_plain_file(path: Path) -> None:
+def hashed_filename(name: str, digest: str) -> str:
+    if RE_HASHED.match(name):
+        return re.sub(
+            r"-payload-[a-f0-9]{64}\.tar\.gz$",
+            rf"-payload-{digest}.tar.gz",
+            name,
+            flags=re.IGNORECASE,
+        )
+    return re.sub(
+        r"(-payload)\.tar\.gz$",
+        rf"\1-{digest}.tar.gz",
+        name,
+        flags=re.IGNORECASE,
+    )
+
+
+def ensure_hashed_path(path: Path, digest: str) -> Path:
+    new_name = hashed_filename(path.name, digest)
+    if new_name == path.name:
+        return path
+
+    new_path = path.parent / new_name
+    if new_path.exists() and new_path.resolve() != path.resolve():
+        LOG.warning("target already exists, using existing file: %s", new_path)
+        return new_path
+
+    old_name = path.name
+    path.rename(new_path)
+    LOG.info("renamed to content hash: %s -> %s", old_name, new_name)
+    return new_path
+
+
+def register_tarball(path: Path) -> None:
     parsed = parse_tarball_name(path.name)
     if not parsed:
         return
-    old_name = path.name
 
     digest = sha256_file(path)
-    new_name = re.sub(
-        r"(-payload)\.tar\.gz$",
-        rf"\1-{digest}.tar.gz",
-        path.name,
-        flags=re.IGNORECASE,
-    )
-    new_path = path.parent / new_name
-    if new_path.exists() and new_path != path:
-        LOG.warning("target already exists, skipping rename: %s", new_path)
-        return
+    final_path = ensure_hashed_path(path, digest)
+    resolved = str(final_path.resolve())
 
-    path.rename(new_path)
+    conn = db_connect()
     try:
-        conn = db_connect()
-        try:
-            insert_version(
-                conn,
-                digest_hex=digest,
-                version=parsed.version,
-                os_label=parsed.os_label,
-                full_name=new_name,
-                file_path=str(new_path.resolve()),
-            )
-        finally:
-            conn.close()
-    except pymysql.MySQLError:
-        new_path.rename(path)
-        raise
+        if not needs_registration(
+            conn,
+            version=parsed.version,
+            os_label=parsed.os_label,
+            file_path=resolved,
+            digest_hex=digest,
+        ):
+            return
+
+        insert_version(
+            conn,
+            digest_hex=digest,
+            version=parsed.version,
+            os_label=parsed.os_label,
+            full_name=final_path.name,
+            file_path=resolved,
+        )
+    finally:
+        conn.close()
 
     LOG.info(
-        "hashed + renamed + recorded: %s -> %s (version=%s os=%s)",
-        old_name,
-        new_name,
+        "recorded: %s (version=%s os=%s uuid=%s)",
+        final_path.name,
         parsed.version,
         parsed.os_label or "—",
+        digest[:12] + "…",
     )
 
 
@@ -172,19 +231,16 @@ def scan_once() -> None:
         if not path.name.lower().endswith(".tar.gz"):
             continue
 
-        if RE_HASHED.match(path.name):
+        if not (RE_PLAIN.match(path.name) or RE_HASHED.match(path.name)):
+            LOG.debug("ignored (pattern): %s", path.name)
             continue
 
-        if RE_PLAIN.match(path.name):
-            try:
-                process_plain_file(path)
-            except OSError as e:
-                LOG.error("failed processing %s: %s", path, e)
-            except pymysql.MySQLError as e:
-                LOG.error("database error for %s: %s", path, e)
-            continue
-
-        LOG.debug("ignored (pattern): %s", path.name)
+        try:
+            register_tarball(path)
+        except OSError as e:
+            LOG.error("failed processing %s: %s", path, e)
+        except pymysql.MySQLError as e:
+            LOG.error("database error for %s: %s", path, e)
 
 
 def main() -> None:
